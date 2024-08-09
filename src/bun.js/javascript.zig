@@ -114,7 +114,7 @@ pub const bun_file_import_path = "/node_modules.server.bun";
 export var has_bun_garbage_collector_flag_enabled = false;
 
 const SourceMap = @import("../sourcemap/sourcemap.zig");
-const ParsedSourceMap = SourceMap.Mapping.ParsedSourceMap;
+const ParsedSourceMap = SourceMap.ParsedSourceMap;
 const MappingList = SourceMap.Mapping.List;
 const SourceProviderMap = SourceMap.SourceProviderMap;
 
@@ -123,14 +123,14 @@ const uv = bun.windows.libuv;
 pub const SavedSourceMap = struct {
     /// This is a pointer to the map located on the VirtualMachine struct
     map: *HashTable,
-    mutex: bun.Lock = bun.Lock.init(),
+    mutex: bun.Lock = .{},
 
     pub const vlq_offset = 24;
 
     pub fn init(this: *SavedSourceMap, map: *HashTable) void {
         this.* = .{
             .map = map,
-            .mutex = bun.Lock.init(),
+            .mutex = .{},
         };
 
         this.map.lockPointers();
@@ -340,7 +340,7 @@ pub const SavedSourceMap = struct {
                 return .{ .map = result };
             },
             Value.Tag.SourceProviderMap => {
-                var ptr = Value.from(mapping.value_ptr.*).as(SourceProviderMap);
+                const ptr: *SourceProviderMap = Value.from(mapping.value_ptr.*).as(SourceProviderMap);
                 this.unlock();
 
                 // Do not lock the mutex while we're parsing JSON!
@@ -369,6 +369,7 @@ pub const SavedSourceMap = struct {
                 if (Environment.allow_assert) {
                     @panic("Corrupt pointer tag");
                 }
+                this.unlock();
                 return .{};
             },
         }
@@ -646,6 +647,10 @@ export fn Bun__getVerboseFetchValue() i32 {
     };
 }
 
+const body_value_pool_size = if (bun.heap_breakdown.enabled) 0 else 256;
+pub const BodyValueRef = bun.HiveRef(JSC.WebCore.Body.Value, body_value_pool_size);
+const BodyValueHiveAllocator = bun.HiveArray(BodyValueRef, body_value_pool_size).Fallback;
+
 /// TODO: rename this to ScriptExecutionContext
 /// This is the shared global state for a single JS instance execution
 /// Today, Bun is one VM per thread, so the name "VirtualMachine" sort of makes sense
@@ -781,9 +786,15 @@ pub const VirtualMachine = struct {
 
     debug_thread_id: if (Environment.allow_assert) std.Thread.Id else void,
 
+    body_value_hive_allocator: BodyValueHiveAllocator = undefined,
+
     pub const OnUnhandledRejection = fn (*VirtualMachine, globalObject: *JSC.JSGlobalObject, JSC.JSValue) void;
 
     pub const OnException = fn (*ZigException) void;
+
+    pub fn initRequestBodyValue(this: *VirtualMachine, body: JSC.WebCore.Body.Value) !*BodyValueRef {
+        return BodyValueRef.init(body, &this.body_value_hive_allocator);
+    }
 
     pub fn uwsLoop(this: *const VirtualMachine) *uws.Loop {
         if (comptime Environment.isPosix) {
@@ -968,26 +979,44 @@ pub const VirtualMachine = struct {
         };
     }
 
-    pub fn loadExtraEnv(this: *VirtualMachine) void {
+    fn ensureSourceCodePrinter(this: *VirtualMachine) void {
+        if (source_code_printer == null) {
+            const allocator = if (bun.heap_breakdown.enabled) bun.heap_breakdown.namedAllocator("SourceCode") else this.allocator;
+            const writer = try js_printer.BufferWriter.init(allocator);
+            source_code_printer = allocator.create(js_printer.BufferPrinter) catch unreachable;
+            source_code_printer.?.* = js_printer.BufferPrinter.init(writer);
+            source_code_printer.?.ctx.append_null_byte = false;
+        }
+    }
+
+    pub fn loadExtraEnvAndSourceCodePrinter(this: *VirtualMachine) void {
         var map = this.bundler.env.map;
+
+        ensureSourceCodePrinter(this);
 
         if (map.get("BUN_SHOW_BUN_STACKFRAMES") != null) {
             this.hide_bun_stackframes = false;
         }
 
+        if (bun.getRuntimeFeatureFlag("BUN_FEATURE_FLAG_DISABLE_ASYNC_TRANSPILER")) {
+            this.transpiler_store.enabled = false;
+        }
+
         if (map.map.fetchSwapRemove("NODE_CHANNEL_FD")) |kv| {
+            const fd_s = kv.value.value;
             const mode = if (map.map.fetchSwapRemove("NODE_CHANNEL_SERIALIZATION_MODE")) |mode_kv|
                 IPC.Mode.fromString(mode_kv.value.value) orelse .json
             else
                 .json;
-            IPC.log("IPC environment variables: NODE_CHANNEL_FD={d}, NODE_CHANNEL_SERIALIZATION_MODE={s}", .{ kv.value.value, @tagName(mode) });
             if (Environment.isWindows) {
-                this.initIPCInstance(kv.value.value, mode);
+                IPC.log("IPC environment variables: NODE_CHANNEL_FD={s}, NODE_CHANNEL_SERIALIZATION_MODE={s}", .{ fd_s, @tagName(mode) });
+                this.initIPCInstance(fd_s, mode);
             } else {
-                if (std.fmt.parseInt(i32, kv.value.value, 10)) |fd| {
+                IPC.log("IPC environment variables: NODE_CHANNEL_FD={d}, NODE_CHANNEL_SERIALIZATION_MODE={s}", .{ fd_s, @tagName(mode) });
+                if (std.fmt.parseInt(i32, fd_s, 10)) |fd| {
                     this.initIPCInstance(bun.toFD(fd), mode);
                 } else |_| {
-                    Output.warn("Failed to parse IPC channel number '{s}'", .{kv.value.value});
+                    Output.warn("Failed to parse IPC channel number '{s}'", .{fd_s});
                 }
             }
         }
@@ -1011,6 +1040,14 @@ pub const VirtualMachine = struct {
             } else if (strings.eqlComptime(gc_level, "2")) {
                 this.aggressive_garbage_collection = .aggressive;
                 has_bun_garbage_collector_flag_enabled = true;
+            }
+
+            if (map.get("BUN_FEATURE_FLAG_SYNTHETIC_MEMORY_LIMIT")) |value| {
+                if (std.fmt.parseInt(usize, value, 10)) |limit| {
+                    synthetic_allocation_limit = limit;
+                } else |_| {
+                    Output.panic("BUN_FEATURE_FLAG_SYNTHETIC_MEMORY_LIMIT must be a positive integer", .{});
+                }
             }
         }
     }
@@ -1423,6 +1460,7 @@ pub const VirtualMachine = struct {
             this.macro_event_loop.global = this.global;
             this.macro_event_loop.virtual_machine = this;
             this.macro_event_loop.concurrent_tasks = .{};
+            ensureSourceCodePrinter(this);
         }
 
         this.bundler.options.target = .bun_macro;
@@ -1485,7 +1523,7 @@ pub const VirtualMachine = struct {
 
         vm.* = VirtualMachine{
             .global = undefined,
-            .transpiler_store = RuntimeTranspilerStore.init(allocator),
+            .transpiler_store = RuntimeTranspilerStore.init(),
             .allocator = allocator,
             .entry_point = ServerEntryPoint{},
             .bundler = bundler,
@@ -1500,7 +1538,7 @@ pub const VirtualMachine = struct {
             .origin_timer = std.time.Timer.start() catch @panic("Timers are not supported on this system."),
             .origin_timestamp = getOriginTimestamp(),
             .ref_strings = JSC.RefString.Map.init(allocator),
-            .ref_strings_mutex = Lock.init(),
+            .ref_strings_mutex = .{},
             .standalone_module_graph = opts.graph.?,
             .debug_thread_id = if (Environment.allow_assert) std.Thread.getCurrentId() else {},
         };
@@ -1547,14 +1585,8 @@ pub const VirtualMachine = struct {
         vm.regular_event_loop.virtual_machine = vm;
         vm.jsc = vm.global.vm();
 
-        if (source_code_printer == null) {
-            const writer = try js_printer.BufferWriter.init(allocator);
-            source_code_printer = allocator.create(js_printer.BufferPrinter) catch unreachable;
-            source_code_printer.?.* = js_printer.BufferPrinter.init(writer);
-            source_code_printer.?.ctx.append_null_byte = false;
-        }
-
         vm.configureDebugger(opts.debugger);
+        vm.body_value_hive_allocator = BodyValueHiveAllocator.init(bun.typedAllocator(JSC.WebCore.Body.Value));
 
         return vm;
     }
@@ -1600,7 +1632,7 @@ pub const VirtualMachine = struct {
 
         vm.* = VirtualMachine{
             .global = undefined,
-            .transpiler_store = RuntimeTranspilerStore.init(allocator),
+            .transpiler_store = RuntimeTranspilerStore.init(),
             .allocator = allocator,
             .entry_point = ServerEntryPoint{},
             .bundler = bundler,
@@ -1615,7 +1647,7 @@ pub const VirtualMachine = struct {
             .origin_timer = std.time.Timer.start() catch @panic("Please don't mess with timers."),
             .origin_timestamp = getOriginTimestamp(),
             .ref_strings = JSC.RefString.Map.init(allocator),
-            .ref_strings_mutex = Lock.init(),
+            .ref_strings_mutex = .{},
             .debug_thread_id = if (Environment.allow_assert) std.Thread.getCurrentId() else {},
         };
         vm.source_mappings.init(&vm.saved_source_map_table);
@@ -1666,14 +1698,8 @@ pub const VirtualMachine = struct {
         if (opts.smol)
             is_smol_mode = opts.smol;
 
-        if (source_code_printer == null) {
-            const writer = try js_printer.BufferWriter.init(allocator);
-            source_code_printer = allocator.create(js_printer.BufferPrinter) catch unreachable;
-            source_code_printer.?.* = js_printer.BufferPrinter.init(writer);
-            source_code_printer.?.ctx.append_null_byte = false;
-        }
-
         vm.configureDebugger(opts.debugger);
+        vm.body_value_hive_allocator = BodyValueHiveAllocator.init(bun.typedAllocator(JSC.WebCore.Body.Value));
 
         return vm;
     }
@@ -1748,7 +1774,7 @@ pub const VirtualMachine = struct {
         vm.* = VirtualMachine{
             .global = undefined,
             .allocator = allocator,
-            .transpiler_store = RuntimeTranspilerStore.init(allocator),
+            .transpiler_store = RuntimeTranspilerStore.init(),
             .entry_point = ServerEntryPoint{},
             .bundler = bundler,
             .console = console,
@@ -1762,7 +1788,7 @@ pub const VirtualMachine = struct {
             .origin_timer = std.time.Timer.start() catch @panic("Please don't mess with timers."),
             .origin_timestamp = getOriginTimestamp(),
             .ref_strings = JSC.RefString.Map.init(allocator),
-            .ref_strings_mutex = Lock.init(),
+            .ref_strings_mutex = .{},
             .standalone_module_graph = worker.parent.standalone_module_graph,
             .worker = worker,
             .debug_thread_id = if (Environment.allow_assert) std.Thread.getCurrentId() else {},
@@ -1810,12 +1836,7 @@ pub const VirtualMachine = struct {
         vm.regular_event_loop.virtual_machine = vm;
         vm.jsc = vm.global.vm();
         vm.bundler.setAllocator(allocator);
-        if (source_code_printer == null) {
-            const writer = try js_printer.BufferWriter.init(allocator);
-            source_code_printer = allocator.create(js_printer.BufferPrinter) catch unreachable;
-            source_code_printer.?.* = js_printer.BufferPrinter.init(writer);
-            source_code_printer.?.ctx.append_null_byte = false;
-        }
+        vm.body_value_hive_allocator = BodyValueHiveAllocator.init(bun.typedAllocator(JSC.WebCore.Body.Value));
 
         return vm;
     }
@@ -2414,6 +2435,10 @@ pub const VirtualMachine = struct {
 
     // TODO:
     pub fn deinit(this: *VirtualMachine) void {
+        if (source_code_printer) |print| {
+            print.getMutableBuffer().deinit();
+            print.ctx.written = &.{};
+        }
         this.source_mappings.deinit();
         if (this.rare_data) |rare_data| {
             rare_data.deinit();
@@ -2828,13 +2853,13 @@ pub const VirtualMachine = struct {
                 writer: Writer,
                 current_exception_list: ?*ExceptionList = null,
 
-                pub fn iteratorWithColor(_vm: [*c]VM, globalObject: [*c]JSGlobalObject, ctx: ?*anyopaque, nextValue: JSValue) callconv(.C) void {
+                pub fn iteratorWithColor(_vm: [*c]VM, globalObject: *JSGlobalObject, ctx: ?*anyopaque, nextValue: JSValue) callconv(.C) void {
                     iterator(_vm, globalObject, nextValue, ctx.?, true);
                 }
-                pub fn iteratorWithOutColor(_vm: [*c]VM, globalObject: [*c]JSGlobalObject, ctx: ?*anyopaque, nextValue: JSValue) callconv(.C) void {
+                pub fn iteratorWithOutColor(_vm: [*c]VM, globalObject: *JSGlobalObject, ctx: ?*anyopaque, nextValue: JSValue) callconv(.C) void {
                     iterator(_vm, globalObject, nextValue, ctx.?, false);
                 }
-                inline fn iterator(_: [*c]VM, _: [*c]JSGlobalObject, nextValue: JSValue, ctx: ?*anyopaque, comptime color: bool) void {
+                inline fn iterator(_: [*c]VM, _: *JSGlobalObject, nextValue: JSValue, ctx: ?*anyopaque, comptime color: bool) void {
                     const this_ = @as(*@This(), @ptrFromInt(@intFromPtr(ctx)));
                     VirtualMachine.get().printErrorlikeObject(nextValue, null, this_.current_exception_list, Writer, this_.writer, color, allow_side_effects);
                 }
@@ -3026,7 +3051,7 @@ pub const VirtualMachine = struct {
             var sourceURL = frame.source_url.toUTF8(bun.default_allocator);
             defer sourceURL.deinit();
 
-            if (this.source_mappings.resolveMapping(
+            if (this.resolveSourceMapping(
                 sourceURL.slice(),
                 @max(frame.position.line.zeroBased(), 0),
                 @max(frame.position.column.zeroBased(), 0),
@@ -3149,7 +3174,7 @@ pub const VirtualMachine = struct {
                 .prefetched_source_code = null,
             }
         else
-            this.source_mappings.resolveMapping(
+            this.resolveSourceMapping(
                 top_source_url.slice(),
                 @max(top.position.line.zeroBased(), 0),
                 @max(top.position.column.zeroBased(), 0),
@@ -3221,7 +3246,7 @@ pub const VirtualMachine = struct {
                 if (frame == top or frame.position.isInvalid()) continue;
                 const source_url = frame.source_url.toUTF8(bun.default_allocator);
                 defer source_url.deinit();
-                if (this.source_mappings.resolveMapping(
+                if (this.resolveSourceMapping(
                     source_url.slice(),
                     @max(frame.position.line.zeroBased(), 0),
                     @max(frame.position.column.zeroBased(), 0),
@@ -3669,6 +3694,37 @@ pub const VirtualMachine = struct {
         }
 
         writer.print("\n", .{}) catch {};
+    }
+
+    pub fn resolveSourceMapping(
+        this: *VirtualMachine,
+        path: []const u8,
+        line: i32,
+        column: i32,
+        source_handling: SourceMap.SourceContentHandling,
+    ) ?SourceMap.Mapping.Lookup {
+        return this.source_mappings.resolveMapping(path, line, column, source_handling) orelse {
+            if (this.standalone_module_graph) |graph| {
+                const file = graph.find(path) orelse return null;
+                const map = file.sourcemap.load() orelse return null;
+
+                map.ref();
+
+                this.source_mappings.putValue(path, SavedSourceMap.Value.init(map)) catch
+                    bun.outOfMemory();
+
+                const mapping = SourceMap.Mapping.find(map.mappings, line, column) orelse
+                    return null;
+
+                return .{
+                    .mapping = mapping,
+                    .source_map = map,
+                    .prefetched_source_code = null,
+                };
+            }
+
+            return null;
+        };
     }
 
     extern fn Process__emitMessageEvent(global: *JSGlobalObject, value: JSValue) void;
@@ -4213,3 +4269,29 @@ export fn Bun__removeSourceProviderSourceMap(vm: *VirtualMachine, opaque_source_
 }
 
 pub export var isBunTest: bool = false;
+
+// TODO: evaluate if this has any measurable performance impact.
+/// Defaults to 4.7 GB, which is the limit for typed arrays
+pub var synthetic_allocation_limit: usize = std.math.maxInt(u32);
+
+comptime {
+    @export(synthetic_allocation_limit, .{ .name = "Bun__syntheticAllocationLimit" });
+}
+
+pub export fn Bun__setSyntheticAllocationLimitForTesting(globalObject: *JSC.JSGlobalObject, callframe: *JSC.CallFrame) callconv(JSC.conv) JSValue {
+    const args = callframe.arguments(1).slice();
+    if (args.len < 1) {
+        globalObject.throwNotEnoughArguments("setSyntheticAllocationLimitForTesting", 1, args.len);
+        return JSValue.zero;
+    }
+
+    if (!args[0].isNumber()) {
+        globalObject.throwInvalidArguments("setSyntheticAllocationLimitForTesting expects a number", .{});
+        return JSValue.zero;
+    }
+
+    const limit: usize = @intCast(@max(args[0].coerceToInt64(globalObject), 1024 * 1024));
+    const prev = synthetic_allocation_limit;
+    synthetic_allocation_limit = limit;
+    return JSValue.jsNumber(prev);
+}
